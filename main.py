@@ -2,6 +2,8 @@ import asyncio
 import os
 import re
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,20 +30,18 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 REMOVE_LINKS = os.getenv("REMOVE_LINKS", "true").lower() in {"1", "true", "yes", "on"}
 HASHTAGS = os.getenv("HASHTAGS", "").strip()
 THUMBNAIL_PATH = os.getenv("THUMBNAIL_PATH", "").strip()
-MAX_CAPTION = 4096
+MAX_CAPTION = 1024  # Telegram media captions are limited to 1024 characters.
 
 # SQLite is used only for bot state/tracking. The Telegram session is kept in the host secret.
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.execute(
-    """CREATE TABLE IF NOT EXISTS processed(
-        source_chat TEXT,
-        source_msg_id INTEGER,
-        fingerprint TEXT,
-        destination_msg_id INTEGER,
-        status TEXT,
-        PRIMARY KEY(source_chat, source_msg_id)
-    )"""
-)
+db.execute("""CREATE TABLE IF NOT EXISTS processed(
+    source_chat TEXT,
+    source_msg_id INTEGER,
+    fingerprint TEXT,
+    destination_msg_id INTEGER,
+    status TEXT,
+    PRIMARY KEY(source_chat, source_msg_id)
+)""")
 db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS filters(keyword TEXT PRIMARY KEY)")
 db.execute("CREATE INDEX IF NOT EXISTS idx_processed_fp ON processed(fingerprint)")
@@ -122,16 +122,8 @@ def parse(name):
     title = re.sub(r"[\[\]\(\)_\-.]+", " ", title)
     title = re.sub(r"\s+", " ", title).strip()
 
-    return {
-        "title": title,
-        "year": year,
-        "language": language,
-        "quality": quality,
-        "video_codec": video_codec,
-        "audio_codec": audio_codec,
-        "subtitle": subtitle,
-        "ext": ext,
-    }
+    return {"title": title, "year": year, "language": language, "quality": quality,
+            "video_codec": video_codec, "audio_codec": audio_codec, "subtitle": subtitle, "ext": ext}
 
 
 def make_caption(name, size_mb):
@@ -151,7 +143,6 @@ def make_caption(name, size_mb):
     except KeyError as exc:
         print(f"Invalid template placeholder: {exc}")
         output = f"{values['prefix']} - {parsed['title']} ({parsed['year']}) {parsed['language']} {parsed['quality']} - {parsed['video_codec']} - {parsed['audio_codec']} - {values['size']} - {parsed['subtitle']}.{values['brand']}{parsed['ext']}"
-
     output = re.sub(r"\(\s*\)", "", output)
     output = re.sub(r"\s+-\s+-", " -", output)
     output = re.sub(r"\s{2,}", " ", output).strip()
@@ -166,8 +157,6 @@ def safe_filename(value):
     return value[:240] or "media.mkv"
 
 
-# Koyeb uses the StringSession stored in TELETHON_SESSION.
-# Local development can still use the traditional SESSION_NAME file session.
 if TELETHON_SESSION:
     print("Telethon: using TELETHON_SESSION secret.")
     client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
@@ -179,28 +168,45 @@ paused = False
 process_lock = asyncio.Lock()
 
 
-async def process(message):
-    """Process one source message. A source message is marked only after a final decision."""
-    if paused or done(message.id):
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Dhanu Telegram AutoFilter is running")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+    def log_message(self, format, *args):
         return
 
+
+def start_health_server():
+    port = int(os.getenv("PORT", "8000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server listening on 0.0.0.0:{port}")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+async def process(message):
+    if paused or done(message.id):
+        return
     async with process_lock:
         if paused or done(message.id):
             return
-
         text = (message.raw_text or "").lower()
         filters = get_filters()
         if filters and not all(keyword.lower() in text for keyword in filters):
             mark(message.id, fingerprint(message), None, "filtered")
             return
-
         fp = fingerprint(message)
-        if db.execute(
-            "SELECT 1 FROM processed WHERE fingerprint=? AND status='sent' LIMIT 1", (fp,)
-        ).fetchone():
+        if db.execute("SELECT 1 FROM processed WHERE fingerprint=? AND status='sent' LIMIT 1", (fp,)).fetchone():
             mark(message.id, fp, None, "duplicate")
             return
-
         if not message.media:
             body = clean_text(message.raw_text)
             if not body:
@@ -214,7 +220,6 @@ async def process(message):
         if not path_string:
             print(f"Download failed for source message {message.id}")
             return
-
         path = Path(path_string)
         try:
             original_name = path.name
@@ -224,7 +229,6 @@ async def process(message):
                     if getattr(attr, "file_name", None):
                         original_name = attr.file_name
                         break
-
             size_mb = path.stat().st_size / (1024 * 1024)
             caption = make_caption(original_name, size_mb)
             target = path.with_name(safe_filename(caption))
@@ -234,15 +238,9 @@ async def process(message):
                     path = target
                 except OSError:
                     pass
-
-            send_kwargs = {
-                "caption": caption,
-                "force_document": True,
-                "supports_streaming": True,
-            }
+            send_kwargs = {"caption": caption, "force_document": True, "supports_streaming": True}
             if THUMBNAIL_PATH and Path(THUMBNAIL_PATH).is_file():
                 send_kwargs["thumb"] = THUMBNAIL_PATH
-
             sent = await client.send_file(DESTINATION_CHAT, str(path), **send_kwargs)
             mark(message.id, fp, sent.id, "sent")
         finally:
@@ -293,28 +291,15 @@ def owner(handler):
 
 @owner
 async def start(update, context):
-    await update.message.reply_text(
-        "Dhanu Auto Filter V1 online.\n"
-        "/status /filters /scan [count] /pause /resume /settings\n"
-        "/addfilter /removefilter /setprefix /setbrand /settemplate"
-    )
+    await update.message.reply_text("Dhanu Auto Filter V1 online.\n/status /filters /scan [count] /pause /resume /settings\n/addfilter /removefilter /setprefix /setbrand /settemplate")
 
 
 @owner
 async def status(update, context):
     total = db.execute("SELECT COUNT(*) FROM processed").fetchone()[0]
-
     def count_status(status):
         return db.execute("SELECT COUNT(*) FROM processed WHERE status=?", (status,)).fetchone()[0]
-
-    await update.message.reply_text(
-        f"{'PAUSED' if paused else 'RUNNING'}\n"
-        f"Processed: {total}\n"
-        f"Sent: {count_status('sent')}\n"
-        f"Duplicate: {count_status('duplicate')}\n"
-        f"Filtered: {count_status('filtered')}\n"
-        f"Empty: {count_status('empty')}"
-    )
+    await update.message.reply_text(f"{'PAUSED' if paused else 'RUNNING'}\nProcessed: {total}\nSent: {count_status('sent')}\nDuplicate: {count_status('duplicate')}\nFiltered: {count_status('filtered')}\nEmpty: {count_status('empty')}")
 
 
 @owner
@@ -382,7 +367,6 @@ async def scan_cmd(update, context):
     except ValueError:
         await update.message.reply_text("Usage: /scan [count]")
         return
-
     await update.message.reply_text(f"Starting historical scan: {limit} posts...")
     count = await historical_scan(limit)
     await update.message.reply_text(f"Checked {count} posts.")
@@ -392,7 +376,7 @@ async def scan_cmd(update, context):
 async def pause(update, context):
     global paused
     paused = True
-    await update.message.reply_text("Paused. New and historical processing will stop after the current file operation finishes.")
+    await update.message.reply_text("Paused.")
 
 
 @owner
@@ -405,70 +389,63 @@ async def resume(update, context):
 @owner
 async def settings_cmd(update, context):
     await update.message.reply_text(
-        f"Source: {SOURCE_CHAT}\n"
-        f"Destination: {DESTINATION_CHAT}\n"
-        f"Prefix: {setting('prefix', '@SD_MOVIE_ADDA')}\n"
-        f"Brand: {setting('brand', '_Ɗʜa֟፝nᴜ ⸙_')}\n"
-        f"Remove links: {REMOVE_LINKS}\n"
-        f"Hashtags: {HASHTAGS or 'none'}\n"
-        f"Thumbnail: {'configured' if THUMBNAIL_PATH else 'none'}\n"
-        f"Telethon session: {'configured' if TELETHON_SESSION else 'MISSING'}"
+        f"Source: {SOURCE_CHAT}\nDestination: {DESTINATION_CHAT}\nPrefix: {setting('prefix', '@SD_MOVIE_ADDA')}\nBrand: {setting('brand', '_Ɗʜa֟፝nᴜ ⸙_')}\nRemove links: {REMOVE_LINKS}\nHashtags: {HASHTAGS or 'none'}\nThumbnail: {'configured' if THUMBNAIL_PATH else 'none'}\nTelethon session: {'configured' if TELETHON_SESSION else 'MISSING'}"
     )
 
 
 async def main():
-    print("Starting Dhanu Telegram AutoFilter V1...")
-    print(f"Source configured: {bool(SOURCE_CHAT)} | Destination configured: {bool(DESTINATION_CHAT)}")
-
-    print("Connecting Telethon user client...")
-    await client.start()
-    me = await client.get_me()
-    print(f"Telethon connected as user ID {me.id}.")
-
-    # Resolve the source once at startup so configuration/access errors appear immediately in logs.
-    source_entity = await client.get_entity(SOURCE_CHAT)
-    destination_entity = await client.get_entity(DESTINATION_CHAT)
-    print(f"Source resolved: {getattr(source_entity, 'title', SOURCE_CHAT)}")
-    print(f"Destination resolved: {getattr(destination_entity, 'title', DESTINATION_CHAT)}")
-
-    client.add_event_handler(live, events.NewMessage(chats=SOURCE_CHAT))
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    handlers = {
-        "start": start,
-        "status": status,
-        "addfilter": addfilter,
-        "removefilter": removefilter,
-        "filters": filters_cmd,
-        "setprefix": prefix,
-        "setbrand": brand,
-        "settemplate": template,
-        "scan": scan_cmd,
-        "pause": pause,
-        "resume": resume,
-        "settings": settings_cmd,
-    }
-    for command, handler in handlers.items():
-        app.add_handler(CommandHandler(command, handler))
-
-    print("Starting Telegram control bot...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    print("Dhanu Telegram AutoFilter V1 running.")
-
+    health = None
     try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        await client.disconnect()
+        start_health_server()
+        print("Starting Dhanu Telegram AutoFilter V1...")
+        print(f"Source configured: {bool(SOURCE_CHAT)} | Destination configured: {bool(DESTINATION_CHAT)}")
+        if not TELETHON_SESSION:
+            print("WARNING: TELETHON_SESSION is missing; Koyeb deployment will not have the Telegram user session.")
 
+        print("Connecting Telethon user client...")
+        await client.start()
+        me = await client.get_me()
+        print(f"Telethon connected as user ID {me.id}.")
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
+        source_entity = await client.get_entity(SOURCE_CHAT)
+        destination_entity = await client.get_entity(DESTINATION_CHAT)
+        print(f"Source resolved: {getattr(source_entity, 'title', SOURCE_CHAT)}")
+        print(f"Destination resolved: {getattr(destination_entity, 'title', DESTINATION_CHAT)}")
+
+        client.add_event_handler(live, events.NewMessage(chats=source_entity))
+
+        app = Application.builder().token(BOT_TOKEN).build()
+        handlers = {
+            "start": start, "status": status, "addfilter": addfilter, "removefilter": removefilter,
+            "filters": filters_cmd, "setprefix": prefix, "setbrand": brand, "settemplate": template,
+            "scan": scan_cmd, "pause": pause, "resume": resume, "settings": settings_cmd,
+        }
+        for command, handler in handlers.items():
+            app.add_handler(CommandHandler(command, handler))
+
+        print("Starting Telegram control bot...")
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        print("Dhanu Telegram AutoFilter V1 running.")
+
+        # Automatically process recent historical posts after startup.
+        scan_limit = max(0, min(int(os.getenv("MAX_HISTORY_SCAN", "100")), 10000))
+        if scan_limit:
+            print(f"Starting automatic historical scan: {scan_limit} posts...")
+            asyncio.create_task(historical_scan(scan_limit))
+
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+            await client.disconnect()
     except Exception as exc:
         print(f"FATAL: {type(exc).__name__}: {exc}")
         raise
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
