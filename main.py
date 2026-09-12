@@ -1,5 +1,9 @@
-import asyncio, os, re, sqlite3
+import asyncio
+import os
+import re
+import sqlite3
 from pathlib import Path
+
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
@@ -7,139 +11,439 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler
 
 load_dotenv()
-API_ID=int(os.environ['API_ID']); API_HASH=os.environ['API_HASH']
-BOT_TOKEN=os.environ['BOT_TOKEN']; OWNER_USER_ID=int(os.environ['OWNER_USER_ID'])
-SOURCE_CHAT=os.environ['SOURCE_CHAT']; DESTINATION_CHAT=os.environ['DESTINATION_CHAT']
-SESSION_NAME=os.getenv('SESSION_NAME','user'); DB_PATH=os.getenv('DATABASE_PATH','bot.db')
-DOWNLOAD_DIR=Path(os.getenv('DOWNLOAD_DIR','media_tmp')); DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-db=sqlite3.connect(DB_PATH,check_same_thread=False)
-db.execute('''CREATE TABLE IF NOT EXISTS processed(source_chat TEXT, source_msg_id INTEGER, fingerprint TEXT, destination_msg_id INTEGER, status TEXT, PRIMARY KEY(source_chat,source_msg_id))''')
-db.execute('CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT)')
-db.execute('CREATE TABLE IF NOT EXISTS filters(keyword TEXT PRIMARY KEY)'); db.commit()
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
+SOURCE_CHAT = os.environ["SOURCE_CHAT"]
+DESTINATION_CHAT = os.environ["DESTINATION_CHAT"]
+SESSION_NAME = os.getenv("SESSION_NAME", "user")
+DB_PATH = os.getenv("DATABASE_PATH", "bot.db")
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "media_tmp"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-def setting(k,d=''):
-    r=db.execute('SELECT value FROM settings WHERE key=?',(k,)).fetchone(); return r[0] if r else d
+REMOVE_LINKS = os.getenv("REMOVE_LINKS", "true").lower() in {"1", "true", "yes", "on"}
+HASHTAGS = os.getenv("HASHTAGS", "").strip()
+THUMBNAIL_PATH = os.getenv("THUMBNAIL_PATH", "").strip()
+MAX_CAPTION = 4096
 
-def set_setting(k,v): db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(k,v)); db.commit()
-def get_filters(): return [r[0] for r in db.execute('SELECT keyword FROM filters')]
-def done(mid): return db.execute('SELECT 1 FROM processed WHERE source_chat=? AND source_msg_id=?',(str(SOURCE_CHAT),mid)).fetchone()
-def mark(mid,fp,did,status='sent'):
-    db.execute('INSERT OR REPLACE INTO processed VALUES(?,?,?,?,?)',(str(SOURCE_CHAT),mid,fp,did,status)); db.commit()
+# SQLite is used only for bot state/tracking. The actual Telegram session stays local/host-side.
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.execute(
+    """CREATE TABLE IF NOT EXISTS processed(
+        source_chat TEXT,
+        source_msg_id INTEGER,
+        fingerprint TEXT,
+        destination_msg_id INTEGER,
+        status TEXT,
+        PRIMARY KEY(source_chat, source_msg_id)
+    )"""
+)
+db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS filters(keyword TEXT PRIMARY KEY)")
+db.execute("CREATE INDEX IF NOT EXISTS idx_processed_fp ON processed(fingerprint)")
+db.commit()
 
-def fingerprint(msg):
-    name=''; size=''; doc=getattr(getattr(msg,'media',None),'document',None)
-    if doc:
-        size=str(getattr(doc,'size',''))
-        for a in getattr(doc,'attributes',[]):
-            if getattr(a,'file_name',None): name=a.file_name; break
-    return f'{name}|{size}|{(msg.raw_text or "").strip().lower()}'
+
+def setting(key, default=""):
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, value))
+    db.commit()
+
+
+def get_filters():
+    return [row[0] for row in db.execute("SELECT keyword FROM filters ORDER BY keyword")]
+
+
+def done(message_id):
+    return db.execute(
+        "SELECT 1 FROM processed WHERE source_chat=? AND source_msg_id=?",
+        (str(SOURCE_CHAT), message_id),
+    ).fetchone()
+
+
+def mark(message_id, fingerprint_value, destination_id, status="sent"):
+    db.execute(
+        "INSERT OR REPLACE INTO processed VALUES(?,?,?,?,?)",
+        (str(SOURCE_CHAT), message_id, fingerprint_value, destination_id, status),
+    )
+    db.commit()
+
+
+def fingerprint(message):
+    name = ""
+    size = ""
+    document = getattr(getattr(message, "media", None), "document", None)
+    if document:
+        size = str(getattr(document, "size", ""))
+        for attr in getattr(document, "attributes", []):
+            if getattr(attr, "file_name", None):
+                name = attr.file_name
+                break
+    return f"{name}|{size}|{(message.raw_text or '').strip().lower()}"
+
+
+def clean_text(text):
+    text = text or ""
+    if REMOVE_LINKS:
+        text = re.sub(r"https?://\S+|www\.\S+|t\.me/\S+", "", text, flags=re.I)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
 
 def parse(name):
-    stem=Path(name).stem; ext=Path(name).suffix or '.mkv'
-    m=re.search(r'\b(?:19|20)\d{2}\b',stem); year=m.group(0) if m else ''
-    lang=next((x for x in ['Tamil','Telugu','Hindi','Malayalam','Kannada','English'] if re.search(rf'\b{x}\b',stem,re.I)),'')
-    quality=next((x for x in ['2160p','1080p','720p','480p','HDRip','WEB-DL','WEBRip','BluRay','TSRip'] if re.search(rf'\b{re.escape(x)}\b',stem,re.I)),'')
-    vc=next((x for x in ['x265','x264','HEVC','AV1'] if re.search(rf'\b{re.escape(x)}\b',stem,re.I)),'')
-    ac=next((x for x in ['AAC','AC3','DDP','EAC3','MP3'] if re.search(rf'\b{re.escape(x)}\b',stem,re.I)),'')
-    sub='ESub' if re.search(r'\bESub\b',stem,re.I) else ''
-    title=stem
-    for t in ['Tamil','Telugu','Hindi','Malayalam','Kannada','English','2160p','1080p','720p','480p','HDRip','WEB-DL','WEBRip','BluRay','TSRip','x265','x264','HEVC','AV1','AAC','AC3','DDP','EAC3','MP3','HC','ESub']:
-        title=re.sub(rf'\b{re.escape(t)}\b','',title,flags=re.I)
-    title=re.sub(r'\b(?:19|20)\d{2}\b','',title); title=re.sub(r'[\[\]\(\)_\-.]+',' ',title); title=re.sub(r'\s+',' ',title).strip()
-    return dict(title=title,year=year,language=lang,quality=quality,video_codec=vc,audio_codec=ac,subtitle=sub,ext=ext)
+    stem = Path(name).stem
+    ext = Path(name).suffix or ".mkv"
+    year_match = re.search(r"\b(?:19|20)\d{2}\b", stem)
+    year = year_match.group(0) if year_match else ""
 
-def make_caption(name,size_mb):
-    p=parse(name); template=setting('template','{prefix} - {title} ({year}) {language} {quality} - {video_codec} - {audio_codec} - {size} - {subtitle}.{brand}{ext}')
-    vals={**p,'prefix':setting('prefix','@SD_MOVIE_ADDA'),'brand':setting('brand','_Ɗʜa֟፝nᴜ ⸙_'),'size':f'{size_mb:.0f}MB'}
-    out=template.format(**vals); out=re.sub(r'\(\s*\)','',out); out=re.sub(r'\s+-\s+-',' -',out); return re.sub(r'\s{2,}',' ',out).strip()
+    languages = ["Tamil", "Telugu", "Hindi", "Malayalam", "Kannada", "English"]
+    qualities = ["2160p", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip", "BluRay", "TSRip"]
+    video_codecs = ["x265", "x264", "HEVC", "AV1"]
+    audio_codecs = ["AAC", "AC3", "DDP", "EAC3", "MP3"]
 
-client=TelegramClient(SESSION_NAME,API_ID,API_HASH); paused=False
+    language = next((x for x in languages if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
+    quality = next((x for x in qualities if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
+    video_codec = next((x for x in video_codecs if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
+    audio_codec = next((x for x in audio_codecs if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
+    subtitle = "ESub" if re.search(r"\bESub\b", stem, re.I) else ""
 
-async def process(msg):
-    global paused
-    if paused or done(msg.id): return
-    text=(msg.raw_text or '').lower(); fs=get_filters()
-    if fs and not all(k.lower() in text for k in fs): mark(msg.id,fingerprint(msg),None,'filtered'); return
-    fprint=fingerprint(msg)
-    if db.execute("SELECT 1 FROM processed WHERE fingerprint=? AND status='sent'",(fprint,)).fetchone(): mark(msg.id,fprint,None,'duplicate'); return
-    if not msg.media:
-        sent=await client.send_message(DESTINATION_CHAT,msg.raw_text or ''); mark(msg.id,fprint,sent.id); return
-    path=await client.download_media(msg,file=str(DOWNLOAD_DIR))
-    if not path: mark(msg.id,fprint,None,'download_failed'); return
-    path=Path(path); original=path.name; doc=getattr(getattr(msg,'media',None),'document',None)
-    if doc:
-        for a in getattr(doc,'attributes',[]):
-            if getattr(a,'file_name',None): original=a.file_name; break
-    size=path.stat().st_size/(1024*1024); cap=make_caption(original,size)
-    target=path.with_name(re.sub(r'[\\/:*?"<>|]','_',cap))
-    try: path.rename(target); path=target
-    except OSError: pass
+    title = stem
+    removable = languages + qualities + video_codecs + audio_codecs + ["HC", "ESub"]
+    for token in removable:
+        title = re.sub(rf"\b{re.escape(token)}\b", "", title, flags=re.I)
+    title = re.sub(r"\b(?:19|20)\d{2}\b", "", title)
+    title = re.sub(r"[\[\]\(\)_\-.]+", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+
+    return {
+        "title": title,
+        "year": year,
+        "language": language,
+        "quality": quality,
+        "video_codec": video_codec,
+        "audio_codec": audio_codec,
+        "subtitle": subtitle,
+        "ext": ext,
+    }
+
+
+def make_caption(name, size_mb):
+    parsed = parse(name)
+    template = setting(
+        "template",
+        "{prefix} - {title} ({year}) {language} {quality} - {video_codec} - {audio_codec} - {size} - {subtitle}.{brand}{ext}",
+    )
+    values = {
+        **parsed,
+        "prefix": setting("prefix", "@SD_MOVIE_ADDA"),
+        "brand": setting("brand", "_Ɗʜa֟፝nᴜ ⸙_"),
+        "size": f"{size_mb:.0f}MB",
+    }
     try:
-        sent=await client.send_file(DESTINATION_CHAT,str(path),caption=cap[:4096],force_document=True,supports_streaming=True)
-        mark(msg.id,fprint,sent.id)
-    finally:
-        try: path.unlink()
-        except OSError: pass
+        output = template.format(**values)
+    except KeyError as exc:
+        # A bad custom template must not crash the worker.
+        print(f"Invalid template placeholder: {exc}")
+        output = f"{values['prefix']} - {parsed['title']} ({parsed['year']}) {parsed['language']} {parsed['quality']} - {parsed['video_codec']} - {parsed['audio_codec']} - {values['size']} - {parsed['subtitle']}.{values['brand']}{parsed['ext']}"
 
-async def historical_scan(limit):
-    n=0
-    async for msg in client.iter_messages(SOURCE_CHAT,limit=limit):
-        try: await process(msg); n+=1
-        except FloodWaitError as e: await asyncio.sleep(e.seconds)
-        except Exception as e: print('scan error',msg.id,e)
-    return n
+    output = re.sub(r"\(\s*\)", "", output)
+    output = re.sub(r"\s+-\s+-", " -", output)
+    output = re.sub(r"\s{2,}", " ", output).strip()
+    if HASHTAGS:
+        output = f"{output}\n\n{HASHTAGS}"
+    return output[:MAX_CAPTION]
+
+
+def safe_filename(value):
+    value = re.sub(r'[\\/:*?"<>|\r\n]', "_", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    # Telegram/document filenames should remain reasonably portable.
+    return value[:240] or "media.mkv"
+
+
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+paused = False
+process_lock = asyncio.Lock()
+
+
+async def process(message):
+    """Process one source message. A source message is marked only after a final decision."""
+    if paused or done(message.id):
+        return
+
+    async with process_lock:
+        if paused or done(message.id):
+            return
+
+        text = (message.raw_text or "").lower()
+        filters = get_filters()
+        if filters and not all(keyword.lower() in text for keyword in filters):
+            mark(message.id, fingerprint(message), None, "filtered")
+            return
+
+        fp = fingerprint(message)
+        if db.execute(
+            "SELECT 1 FROM processed WHERE fingerprint=? AND status='sent' LIMIT 1", (fp,)
+        ).fetchone():
+            mark(message.id, fp, None, "duplicate")
+            return
+
+        # Text-only posts are copied as cleaned text without unnecessary downloading.
+        if not message.media:
+            body = clean_text(message.raw_text)
+            if not body:
+                mark(message.id, fp, None, "empty")
+                return
+            sent = await client.send_message(DESTINATION_CHAT, body)
+            mark(message.id, fp, sent.id, "sent")
+            return
+
+        path_string = await client.download_media(message, file=str(DOWNLOAD_DIR))
+        if not path_string:
+            print(f"Download failed for source message {message.id}")
+            return
+
+        path = Path(path_string)
+        try:
+            original_name = path.name
+            document = getattr(getattr(message, "media", None), "document", None)
+            if document:
+                for attr in getattr(document, "attributes", []):
+                    if getattr(attr, "file_name", None):
+                        original_name = attr.file_name
+                        break
+
+            size_mb = path.stat().st_size / (1024 * 1024)
+            caption = make_caption(original_name, size_mb)
+            target = path.with_name(safe_filename(caption))
+            if target != path:
+                try:
+                    path.rename(target)
+                    path = target
+                except OSError:
+                    pass
+
+            send_kwargs = {
+                "caption": caption,
+                "force_document": True,
+                "supports_streaming": True,
+            }
+            if THUMBNAIL_PATH and Path(THUMBNAIL_PATH).is_file():
+                send_kwargs["thumb"] = THUMBNAIL_PATH
+
+            sent = await client.send_file(DESTINATION_CHAT, str(path), **send_kwargs)
+            mark(message.id, fp, sent.id, "sent")
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+async def historical_scan(limit=100):
+    """Scan the newest N source posts. Existing/live posts are skipped by DB state."""
+    count = 0
+    async for message in client.iter_messages(SOURCE_CHAT, limit=limit):
+        if paused:
+            break
+        try:
+            await process(message)
+            count += 1
+        except FloodWaitError as exc:
+            print(f"Flood wait: {exc.seconds}s")
+            await asyncio.sleep(exc.seconds)
+        except Exception as exc:
+            print(f"Scan error on message {message.id}: {exc}")
+    return count
+
 
 async def live(event):
-    try: await process(event.message)
-    except FloodWaitError as e: await asyncio.sleep(e.seconds)
-    except Exception as e: print('live error',e)
+    try:
+        await process(event.message)
+    except FloodWaitError as exc:
+        print(f"Live flood wait: {exc.seconds}s")
+        await asyncio.sleep(exc.seconds)
+        try:
+            await process(event.message)
+        except Exception as retry_exc:
+            print(f"Live retry error: {retry_exc}")
+    except Exception as exc:
+        print(f"Live error: {exc}")
 
-def owner(fn):
-    async def wrapper(update,context):
-        if update.effective_user and update.effective_user.id==OWNER_USER_ID: return await fn(update,context)
+
+def owner(handler):
+    async def wrapper(update: Update, context):
+        if update.effective_user and update.effective_user.id == OWNER_USER_ID:
+            return await handler(update, context)
+        if update.effective_message:
+            await update.effective_message.reply_text("Not authorized.")
     return wrapper
 
+
 @owner
-async def start(u,c): await u.message.reply_text('Dhanu Auto Filter V1 online.\n/status /filters /scan /pause /resume /settings')
+async def start(update, context):
+    await update.message.reply_text(
+        "Dhanu Auto Filter V1 online.\n"
+        "/status /filters /scan [count] /pause /resume /settings\n"
+        "/addfilter /removefilter /setprefix /setbrand /settemplate"
+    )
+
+
 @owner
-async def status(u,c):
-    total=db.execute('SELECT COUNT(*) FROM processed').fetchone()[0]
-    def q(s): return db.execute('SELECT COUNT(*) FROM processed WHERE status=?',(s,)).fetchone()[0]
-    await u.message.reply_text(f"{'PAUSED' if paused else 'RUNNING'}\nProcessed: {total}\nSent: {q('sent')}\nDuplicate: {q('duplicate')}\nFiltered: {q('filtered')}")
+async def status(update, context):
+    total = db.execute("SELECT COUNT(*) FROM processed").fetchone()[0]
+
+    def count_status(status):
+        return db.execute("SELECT COUNT(*) FROM processed WHERE status=?", (status,)).fetchone()[0]
+
+    await update.message.reply_text(
+        f"{'PAUSED' if paused else 'RUNNING'}\n"
+        f"Processed: {total}\n"
+        f"Sent: {count_status('sent')}\n"
+        f"Duplicate: {count_status('duplicate')}\n"
+        f"Filtered: {count_status('filtered')}\n"
+        f"Empty: {count_status('empty')}"
+    )
+
+
 @owner
-async def addfilter(u,c):
-    k=' '.join(c.args).strip()
-    if not k: return await u.message.reply_text('Usage: /addfilter keyword')
-    db.execute('INSERT OR IGNORE INTO filters VALUES(?)',(k,)); db.commit(); await u.message.reply_text('Filter added: '+k)
+async def addfilter(update, context):
+    keyword = " ".join(context.args).strip()
+    if not keyword:
+        await update.message.reply_text("Usage: /addfilter keyword")
+        return
+    db.execute("INSERT OR IGNORE INTO filters VALUES(?)", (keyword,))
+    db.commit()
+    await update.message.reply_text(f"Filter added: {keyword}")
+
+
 @owner
-async def removefilter(u,c):
-    k=' '.join(c.args).strip(); db.execute('DELETE FROM filters WHERE keyword=?',(k,)); db.commit(); await u.message.reply_text('Filter removed.')
+async def removefilter(update, context):
+    keyword = " ".join(context.args).strip()
+    if not keyword:
+        await update.message.reply_text("Usage: /removefilter keyword")
+        return
+    db.execute("DELETE FROM filters WHERE keyword=?", (keyword,))
+    db.commit()
+    await update.message.reply_text("Filter removed.")
+
+
 @owner
-async def filters_cmd(u,c): await u.message.reply_text('\n'.join(get_filters()) or 'No filters.')
+async def filters_cmd(update, context):
+    await update.message.reply_text("\n".join(get_filters()) or "No filters.")
+
+
 @owner
-async def prefix(u,c): set_setting('prefix',' '.join(c.args).strip()); await u.message.reply_text('Prefix updated.')
+async def prefix(update, context):
+    value = " ".join(context.args).strip()
+    if not value:
+        await update.message.reply_text("Usage: /setprefix @NAME")
+        return
+    set_setting("prefix", value)
+    await update.message.reply_text("Prefix updated.")
+
+
 @owner
-async def brand(u,c): set_setting('brand',' '.join(c.args).strip()); await u.message.reply_text('Brand updated.')
+async def brand(update, context):
+    value = " ".join(context.args).strip()
+    if not value:
+        await update.message.reply_text("Usage: /setbrand BRAND")
+        return
+    set_setting("brand", value)
+    await update.message.reply_text("Brand updated.")
+
+
 @owner
-async def template(u,c): set_setting('template',' '.join(c.args).strip()); await u.message.reply_text('Template updated.')
+async def template(update, context):
+    value = " ".join(context.args).strip()
+    if not value:
+        await update.message.reply_text("Usage: /settemplate {prefix} - {title} ({year}) ...")
+        return
+    set_setting("template", value)
+    await update.message.reply_text("Template updated.")
+
+
 @owner
-async def scan_cmd(u,c):
-    n=await historical_scan(int(c.args[0]) if c.args else int(os.getenv('MAX_HISTORY_SCAN','100'))); await u.message.reply_text(f'Checked {n} posts.')
+async def scan_cmd(update, context):
+    try:
+        limit = int(context.args[0]) if context.args else int(os.getenv("MAX_HISTORY_SCAN", "100"))
+        limit = max(1, min(limit, 10000))
+    except ValueError:
+        await update.message.reply_text("Usage: /scan [count]")
+        return
+
+    await update.message.reply_text(f"Starting historical scan: {limit} posts...")
+    count = await historical_scan(limit)
+    await update.message.reply_text(f"Checked {count} posts.")
+
+
 @owner
-async def pause(u,c):
-    global paused; paused=True; await u.message.reply_text('Paused.')
+async def pause(update, context):
+    global paused
+    paused = True
+    await update.message.reply_text("Paused. New and historical processing will stop after the current file operation finishes.")
+
+
 @owner
-async def resume(u,c):
-    global paused; paused=False; await u.message.reply_text('Resumed.')
+async def resume(update, context):
+    global paused
+    paused = False
+    await update.message.reply_text("Resumed.")
+
+
 @owner
-async def settings_cmd(u,c): await u.message.reply_text(f'Source: {SOURCE_CHAT}\nDestination: {DESTINATION_CHAT}\nPrefix: {setting("prefix","@SD_MOVIE_ADDA")}\nBrand: {setting("brand","_Ɗʜa֟፝nᴜ ⸙_")}')
+async def settings_cmd(update, context):
+    await update.message.reply_text(
+        f"Source: {SOURCE_CHAT}\n"
+        f"Destination: {DESTINATION_CHAT}\n"
+        f"Prefix: {setting('prefix', '@SD_MOVIE_ADDA')}\n"
+        f"Brand: {setting('brand', '_Ɗʜa֟፝nᴜ ⸙_')}\n"
+        f"Remove links: {REMOVE_LINKS}\n"
+        f"Hashtags: {HASHTAGS or 'none'}\n"
+        f"Thumbnail: {'configured' if THUMBNAIL_PATH else 'none'}"
+    )
+
 
 async def main():
-    await client.start(); client.add_event_handler(live,events.NewMessage(chats=SOURCE_CHAT))
-    app=Application.builder().token(BOT_TOKEN).build()
-    handlers={'start':start,'status':status,'addfilter':addfilter,'removefilter':removefilter,'filters':filters_cmd,'setprefix':prefix,'setbrand':brand,'settemplate':template,'scan':scan_cmd,'pause':pause,'resume':resume,'settings':settings_cmd}
-    for cmd,fn in handlers.items(): app.add_handler(CommandHandler(cmd,fn))
-    await app.initialize(); await app.start(); await app.updater.start_polling(); print('Running.'); await asyncio.Event().wait()
+    await client.start()
+    client.add_event_handler(live, events.NewMessage(chats=SOURCE_CHAT))
 
-if __name__=='__main__': asyncio.run(main())
+    app = Application.builder().token(BOT_TOKEN).build()
+    handlers = {
+        "start": start,
+        "status": status,
+        "addfilter": addfilter,
+        "removefilter": removefilter,
+        "filters": filters_cmd,
+        "setprefix": prefix,
+        "setbrand": brand,
+        "settemplate": template,
+        "scan": scan_cmd,
+        "pause": pause,
+        "resume": resume,
+        "settings": settings_cmd,
+    }
+    for command, handler in handlers.items():
+        app.add_handler(CommandHandler(command, handler))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    print("Dhanu Telegram AutoFilter V1 running.")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await client.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
