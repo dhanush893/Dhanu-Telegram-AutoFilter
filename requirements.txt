@@ -1,0 +1,6 @@
+telethon>=1.45,<2
+python-telegram-bot>=22,<23
+python-dotenv>=1.1,<2
+cryptg>=0.5
+hachoir>=3.3
+Pillow>=11,<13
