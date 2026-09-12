@@ -8,4 +8,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "main.py"]
+# Import health_server first so its Telethon numeric-ID resolver is active in main.
+CMD ["python", "-c", "import health_server; import main; import asyncio; asyncio.run(main.main())"]
