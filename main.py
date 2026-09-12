@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 from telegram import Update
 from telegram.ext import Application, CommandHandler
 
@@ -19,6 +20,7 @@ OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
 SOURCE_CHAT = os.environ["SOURCE_CHAT"]
 DESTINATION_CHAT = os.environ["DESTINATION_CHAT"]
 SESSION_NAME = os.getenv("SESSION_NAME", "user")
+TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "bot.db")
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "media_tmp"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,7 +30,7 @@ HASHTAGS = os.getenv("HASHTAGS", "").strip()
 THUMBNAIL_PATH = os.getenv("THUMBNAIL_PATH", "").strip()
 MAX_CAPTION = 4096
 
-# SQLite is used only for bot state/tracking. The actual Telegram session stays local/host-side.
+# SQLite is used only for bot state/tracking. The Telegram session is kept in the host secret.
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute(
     """CREATE TABLE IF NOT EXISTS processed(
@@ -147,7 +149,6 @@ def make_caption(name, size_mb):
     try:
         output = template.format(**values)
     except KeyError as exc:
-        # A bad custom template must not crash the worker.
         print(f"Invalid template placeholder: {exc}")
         output = f"{values['prefix']} - {parsed['title']} ({parsed['year']}) {parsed['language']} {parsed['quality']} - {parsed['video_codec']} - {parsed['audio_codec']} - {values['size']} - {parsed['subtitle']}.{values['brand']}{parsed['ext']}"
 
@@ -162,11 +163,18 @@ def make_caption(name, size_mb):
 def safe_filename(value):
     value = re.sub(r'[\\/:*?"<>|\r\n]', "_", value)
     value = re.sub(r"\s+", " ", value).strip()
-    # Telegram/document filenames should remain reasonably portable.
     return value[:240] or "media.mkv"
 
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# Koyeb uses the StringSession stored in TELETHON_SESSION.
+# Local development can still use the traditional SESSION_NAME file session.
+if TELETHON_SESSION:
+    print("Telethon: using TELETHON_SESSION secret.")
+    client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
+else:
+    print("WARNING: TELETHON_SESSION is not set; using local file session.")
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
 paused = False
 process_lock = asyncio.Lock()
 
@@ -193,7 +201,6 @@ async def process(message):
             mark(message.id, fp, None, "duplicate")
             return
 
-        # Text-only posts are copied as cleaned text without unnecessary downloading.
         if not message.media:
             body = clean_text(message.raw_text)
             if not body:
@@ -246,7 +253,6 @@ async def process(message):
 
 
 async def historical_scan(limit=100):
-    """Scan the newest N source posts. Existing/live posts are skipped by DB state."""
     count = 0
     async for message in client.iter_messages(SOURCE_CHAT, limit=limit):
         if paused:
@@ -258,7 +264,7 @@ async def historical_scan(limit=100):
             print(f"Flood wait: {exc.seconds}s")
             await asyncio.sleep(exc.seconds)
         except Exception as exc:
-            print(f"Scan error on message {message.id}: {exc}")
+            print(f"Scan error on message {message.id}: {type(exc).__name__}: {exc}")
     return count
 
 
@@ -271,9 +277,9 @@ async def live(event):
         try:
             await process(event.message)
         except Exception as retry_exc:
-            print(f"Live retry error: {retry_exc}")
+            print(f"Live retry error: {type(retry_exc).__name__}: {retry_exc}")
     except Exception as exc:
-        print(f"Live error: {exc}")
+        print(f"Live error: {type(exc).__name__}: {exc}")
 
 
 def owner(handler):
@@ -405,12 +411,26 @@ async def settings_cmd(update, context):
         f"Brand: {setting('brand', '_Ɗʜa֟፝nᴜ ⸙_')}\n"
         f"Remove links: {REMOVE_LINKS}\n"
         f"Hashtags: {HASHTAGS or 'none'}\n"
-        f"Thumbnail: {'configured' if THUMBNAIL_PATH else 'none'}"
+        f"Thumbnail: {'configured' if THUMBNAIL_PATH else 'none'}\n"
+        f"Telethon session: {'configured' if TELETHON_SESSION else 'MISSING'}"
     )
 
 
 async def main():
+    print("Starting Dhanu Telegram AutoFilter V1...")
+    print(f"Source configured: {bool(SOURCE_CHAT)} | Destination configured: {bool(DESTINATION_CHAT)}")
+
+    print("Connecting Telethon user client...")
     await client.start()
+    me = await client.get_me()
+    print(f"Telethon connected as user ID {me.id}.")
+
+    # Resolve the source once at startup so configuration/access errors appear immediately in logs.
+    source_entity = await client.get_entity(SOURCE_CHAT)
+    destination_entity = await client.get_entity(DESTINATION_CHAT)
+    print(f"Source resolved: {getattr(source_entity, 'title', SOURCE_CHAT)}")
+    print(f"Destination resolved: {getattr(destination_entity, 'title', DESTINATION_CHAT)}")
+
     client.add_event_handler(live, events.NewMessage(chats=SOURCE_CHAT))
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -431,6 +451,7 @@ async def main():
     for command, handler in handlers.items():
         app.add_handler(CommandHandler(command, handler))
 
+    print("Starting Telegram control bot...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -446,4 +467,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        print(f"FATAL: {type(exc).__name__}: {exc}")
+        raise
