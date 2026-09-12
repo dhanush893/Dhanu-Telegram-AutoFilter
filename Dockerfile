@@ -8,4 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "main.py"]
+# Koyeb Web Service requires a listening HTTP/TCP port.
+# Run the Telegram worker and the health server together.
+CMD ["sh", "-c", "python health_server.py & exec python main.py"]
