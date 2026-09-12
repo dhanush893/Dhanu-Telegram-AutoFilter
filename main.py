@@ -19,8 +19,8 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])
-SOURCE_CHAT = os.environ["SOURCE_CHAT"]
-DESTINATION_CHAT = os.environ["DESTINATION_CHAT"]
+SOURCE_CHAT = os.environ["SOURCE_CHAT"].strip()
+DESTINATION_CHAT = os.environ["DESTINATION_CHAT"].strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "user")
 TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "bot.db")
@@ -30,9 +30,9 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 REMOVE_LINKS = os.getenv("REMOVE_LINKS", "true").lower() in {"1", "true", "yes", "on"}
 HASHTAGS = os.getenv("HASHTAGS", "").strip()
 THUMBNAIL_PATH = os.getenv("THUMBNAIL_PATH", "").strip()
-MAX_CAPTION = 1024  # Telegram media captions are limited to 1024 characters.
+MAX_CAPTION = 1024
 
-# SQLite is used only for bot state/tracking. The Telegram session is kept in the host secret.
+# SQLite stores bot state only. Never store the Telegram StringSession here.
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute("""CREATE TABLE IF NOT EXISTS processed(
     source_chat TEXT,
@@ -102,18 +102,15 @@ def parse(name):
     ext = Path(name).suffix or ".mkv"
     year_match = re.search(r"\b(?:19|20)\d{2}\b", stem)
     year = year_match.group(0) if year_match else ""
-
     languages = ["Tamil", "Telugu", "Hindi", "Malayalam", "Kannada", "English"]
     qualities = ["2160p", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip", "BluRay", "TSRip"]
     video_codecs = ["x265", "x264", "HEVC", "AV1"]
     audio_codecs = ["AAC", "AC3", "DDP", "EAC3", "MP3"]
-
     language = next((x for x in languages if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
     quality = next((x for x in qualities if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
     video_codec = next((x for x in video_codecs if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
     audio_codec = next((x for x in audio_codecs if re.search(rf"\b{re.escape(x)}\b", stem, re.I)), "")
     subtitle = "ESub" if re.search(r"\bESub\b", stem, re.I) else ""
-
     title = stem
     removable = languages + qualities + video_codecs + audio_codecs + ["HC", "ESub"]
     for token in removable:
@@ -121,7 +118,6 @@ def parse(name):
     title = re.sub(r"\b(?:19|20)\d{2}\b", "", title)
     title = re.sub(r"[\[\]\(\)_\-.]+", " ", title)
     title = re.sub(r"\s+", " ", title).strip()
-
     return {"title": title, "year": year, "language": language, "quality": quality,
             "video_codec": video_codec, "audio_codec": audio_codec, "subtitle": subtitle, "ext": ext}
 
@@ -166,6 +162,8 @@ else:
 
 paused = False
 process_lock = asyncio.Lock()
+SOURCE_ENTITY = None
+DESTINATION_ENTITY = None
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -192,6 +190,55 @@ def start_health_server():
     return server
 
 
+def normalize_numeric_chat_id(value):
+    raw = str(value).strip()
+    if not re.fullmatch(r"-?\d+", raw):
+        return None
+    number = int(raw)
+    if raw.startswith("-100"):
+        return int(raw[4:])
+    return abs(number)
+
+
+async def resolve_chat(value, label):
+    value = str(value).strip()
+    numeric_id = normalize_numeric_chat_id(value)
+
+    if numeric_id is None:
+        try:
+            return await client.get_entity(value)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{label} '{value}' could not be resolved. Verify the username/invite and account access."
+            ) from exc
+
+    # A raw -100... ID does not contain the access hash Telethon needs for a
+    # private channel. Load dialogs first and obtain the full cached entity.
+    print(f"Resolving {label} numeric ID {value} from Telegram dialogs...")
+    dialogs = await client.get_dialogs()
+    for dialog in dialogs:
+        entity = dialog.entity
+        entity_id = getattr(entity, "id", None)
+        if entity_id == numeric_id:
+            return entity
+
+    # It may already be cached even if it was not returned by the dialog list.
+    try:
+        entity = await client.get_entity(numeric_id)
+        if getattr(entity, "id", None) == numeric_id:
+            return entity
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"{label} '{value}' is not accessible to the Telegram user session. "
+        f"The logged-in Telegram account must be a member of that private channel "
+        f"(user ID {getattr(await client.get_me(), 'id', 'unknown')}). "
+        f"Open/join the channel with that same account, then generate/use a session from that account, "
+        f"or use @username if the channel is public."
+    )
+
+
 async def process(message):
     if paused or done(message.id):
         return
@@ -212,7 +259,7 @@ async def process(message):
             if not body:
                 mark(message.id, fp, None, "empty")
                 return
-            sent = await client.send_message(DESTINATION_CHAT, body)
+            sent = await client.send_message(DESTINATION_ENTITY, body)
             mark(message.id, fp, sent.id, "sent")
             return
 
@@ -241,7 +288,7 @@ async def process(message):
             send_kwargs = {"caption": caption, "force_document": True, "supports_streaming": True}
             if THUMBNAIL_PATH and Path(THUMBNAIL_PATH).is_file():
                 send_kwargs["thumb"] = THUMBNAIL_PATH
-            sent = await client.send_file(DESTINATION_CHAT, str(path), **send_kwargs)
+            sent = await client.send_file(DESTINATION_ENTITY, str(path), **send_kwargs)
             mark(message.id, fp, sent.id, "sent")
         finally:
             try:
@@ -252,7 +299,7 @@ async def process(message):
 
 async def historical_scan(limit=100):
     count = 0
-    async for message in client.iter_messages(SOURCE_CHAT, limit=limit):
+    async for message in client.iter_messages(SOURCE_ENTITY, limit=limit):
         if paused:
             break
         try:
@@ -394,7 +441,7 @@ async def settings_cmd(update, context):
 
 
 async def main():
-    health = None
+    global SOURCE_ENTITY, DESTINATION_ENTITY
     try:
         start_health_server()
         print("Starting Dhanu Telegram AutoFilter V1...")
@@ -407,12 +454,12 @@ async def main():
         me = await client.get_me()
         print(f"Telethon connected as user ID {me.id}.")
 
-        source_entity = await client.get_entity(SOURCE_CHAT)
-        destination_entity = await client.get_entity(DESTINATION_CHAT)
-        print(f"Source resolved: {getattr(source_entity, 'title', SOURCE_CHAT)}")
-        print(f"Destination resolved: {getattr(destination_entity, 'title', DESTINATION_CHAT)}")
+        SOURCE_ENTITY = await resolve_chat(SOURCE_CHAT, "SOURCE_CHAT")
+        DESTINATION_ENTITY = await resolve_chat(DESTINATION_CHAT, "DESTINATION_CHAT")
+        print(f"Source resolved: {getattr(SOURCE_ENTITY, 'title', SOURCE_CHAT)}")
+        print(f"Destination resolved: {getattr(DESTINATION_ENTITY, 'title', DESTINATION_CHAT)}")
 
-        client.add_event_handler(live, events.NewMessage(chats=source_entity))
+        client.add_event_handler(live, events.NewMessage(chats=SOURCE_ENTITY))
 
         app = Application.builder().token(BOT_TOKEN).build()
         handlers = {
@@ -429,7 +476,6 @@ async def main():
         await app.updater.start_polling()
         print("Dhanu Telegram AutoFilter V1 running.")
 
-        # Automatically process recent historical posts after startup.
         scan_limit = max(0, min(int(os.getenv("MAX_HISTORY_SCAN", "100")), 10000))
         if scan_limit:
             print(f"Starting automatic historical scan: {scan_limit} posts...")
