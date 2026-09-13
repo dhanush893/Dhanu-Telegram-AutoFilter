@@ -184,7 +184,14 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     port = int(os.getenv("PORT", "8000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    except OSError as exc:
+        # The container entrypoint may already have bound the health port.
+        if getattr(exc, "errno", None) == 98:
+            print(f"Health server already listening on port {port}; continuing.")
+            return None
+        raise
     print(f"Health server listening on 0.0.0.0:{port}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -212,17 +219,13 @@ async def resolve_chat(value, label):
                 f"{label} '{value}' could not be resolved. Verify the username/invite and account access."
             ) from exc
 
-    # A raw -100... ID does not contain the access hash Telethon needs for a
-    # private channel. Load dialogs first and obtain the full cached entity.
     print(f"Resolving {label} numeric ID {value} from Telegram dialogs...")
     dialogs = await client.get_dialogs()
     for dialog in dialogs:
         entity = dialog.entity
-        entity_id = getattr(entity, "id", None)
-        if entity_id == numeric_id:
+        if getattr(entity, "id", None) == numeric_id:
             return entity
 
-    # It may already be cached even if it was not returned by the dialog list.
     try:
         entity = await client.get_entity(numeric_id)
         if getattr(entity, "id", None) == numeric_id:
