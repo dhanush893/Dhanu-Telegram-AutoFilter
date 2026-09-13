@@ -8,5 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Import health_server first so its Telethon numeric-ID resolver is active in main.
-CMD ["python", "-c", "import health_server; import main; import asyncio; asyncio.run(main.main())"]
+# Bind the health port before importing main so platform health checks do not
+# fail when application configuration is invalid or incomplete.
+CMD ["python", "-u", "entrypoint.py"]
