@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import threading
+import website_publisher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -290,6 +291,10 @@ async def process(message):
                 send_kwargs["thumb"] = THUMBNAIL_PATH
             sent = await client.send_file(DESTINATION_ENTITY, str(path), **send_kwargs)
             mark(message.id, fp, sent.id, "sent")
+            try:
+                await asyncio.to_thread(website_publisher.publish_movie_metadata, original_name, size_mb, message.id, parse(original_name))
+            except Exception as publish_exc:
+                print(f"Website metadata publish failed; Telegram upload already succeeded: {type(publish_exc).__name__}: {publish_exc}")
         finally:
             try:
                 path.unlink()
