@@ -12,7 +12,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telegram import Update
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 load_dotenv()
 
@@ -412,6 +412,28 @@ async def template(update, context):
 
 
 @owner
+@owner
+async def receive_file(update, context):
+    """Publish metadata for files sent directly to the bot by its owner."""
+    message = update.effective_message
+    if not message:
+        return
+    media = message.document or message.video or message.audio or message.animation
+    if not media:
+        return
+    name = getattr(media, "file_name", None) or f"telegram-file-{message.message_id}"
+    size_bytes = getattr(media, "file_size", 0) or 0
+    if not os.getenv("WEBSITE_WEBHOOK_URL", "").strip() or not os.getenv("WEBSITE_WEBHOOK_SECRET", "").strip():
+        await message.reply_text("File received. Website publishing is not configured yet.")
+        return
+    try:
+        await asyncio.to_thread(website_publisher.publish_movie_metadata, name, size_bytes / (1024 * 1024), message.message_id, parse(name))
+        await message.reply_text("Movie metadata published to SD MOVIE ADDA. The media file itself was not uploaded to the website.")
+    except Exception as exc:
+        print(f"Direct-file metadata publish failed: {type(exc).__name__}: {exc}")
+        await message.reply_text("Could not publish metadata. Check the website webhook configuration and logs.")
+
+
 async def scan_cmd(update, context):
     try:
         limit = int(context.args[0]) if context.args else int(os.getenv("MAX_HISTORY_SCAN", "100"))
@@ -474,6 +496,7 @@ async def main():
         }
         for command, handler in handlers.items():
             app.add_handler(CommandHandler(command, handler))
+        app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.ANIMATION, receive_file))
 
         print("Starting Telegram control bot...")
         await app.initialize()
