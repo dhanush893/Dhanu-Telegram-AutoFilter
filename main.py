@@ -412,7 +412,6 @@ async def template(update, context):
 
 
 @owner
-@owner
 async def receive_file(update, context):
     """Publish metadata for files sent directly to the bot by its owner."""
     message = update.effective_message
@@ -434,6 +433,7 @@ async def receive_file(update, context):
         await message.reply_text("Could not publish metadata. Check the website webhook configuration and logs.")
 
 
+@owner
 async def scan_cmd(update, context):
     try:
         limit = int(context.args[0]) if context.args else int(os.getenv("MAX_HISTORY_SCAN", "100"))
