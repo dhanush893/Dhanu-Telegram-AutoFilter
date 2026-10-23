@@ -8,7 +8,8 @@ def publish_movie_metadata(name, size_mb, source_message_id, parsed):
     if not endpoint or not secret:
         return
     title = parsed.get("title") or Path(name).stem
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:160] or f"movie-{source_message_id}"
+    slug_seed = " ".join([title, parsed.get("year", ""), parsed.get("language", ""), parsed.get("quality", "")])
+    slug = re.sub(r"[^a-z0-9]+", "-", slug_seed.lower()).strip("-")[:160] or f"movie-{source_message_id}"
     payload = {"slug": slug, "title": title, "year": parsed.get("year", ""), "language": parsed.get("language") or "Unknown", "quality": parsed.get("quality") or "Not specified", "file_name": name, "file_size_mb": round(float(size_mb), 2), "source_message_id": str(source_message_id)}
     req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "X-Webhook-Secret": secret}, method="POST")
     with urllib.request.urlopen(req, timeout=8) as response:
